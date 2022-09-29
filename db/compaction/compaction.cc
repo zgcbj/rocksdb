@@ -545,10 +545,8 @@ std::unique_ptr<CompactionFilter> Compaction::CreateCompactionFilter(
   context.is_full_compaction = is_full_compaction_;
   context.is_manual_compaction = is_manual_compaction_;
   context.is_bottommost_level = bottommost_level_;
-  context.start_key =
-      (start == nullptr) ? GetSmallestUserKey() : ExtractUserKey(*start);
-  context.end_key =
-      (end == nullptr) ? GetLargestUserKey() : ExtractUserKey(*end);
+  context.start_key = (start == nullptr) ? GetSmallestUserKey() : *start;
+  context.end_key = (end == nullptr) ? GetLargestUserKey() : *end;
   context.is_end_key_inclusive = (end == nullptr);
   for (auto l = inputs_.begin(); l != inputs_.end(); ++l) {
     for (auto f = l->files.begin(); f != l->files.end(); ++f) {
