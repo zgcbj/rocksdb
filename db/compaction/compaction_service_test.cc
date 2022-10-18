@@ -546,6 +546,59 @@ TEST_P(CompactionServiceTest, CompactionFilter) {
   ASSERT_GE(my_cs->GetCompactionNum(), 1);
 }
 
+class EmptyFilter : public CompactionFilter {
+ public:
+  bool Filter(int /*level*/, const Slice& /*key*/, const Slice& /*value*/,
+              std::string* /*new_value*/,
+              bool* /*value_changed*/) const override {
+    return false;
+  }
+
+  const char* Name() const override { return "EmptyFilter"; }
+};
+
+class EmptyFilterFactory : public CompactionFilterFactory {
+ public:
+  explicit EmptyFilterFactory() : compaction_filter_created_(false) {}
+
+  std::unique_ptr<CompactionFilter> CreateCompactionFilter(
+      const CompactionFilter::Context&) override {
+    compaction_filter_created_ = true;
+    return std::unique_ptr<CompactionFilter>(new EmptyFilter());
+  }
+
+  bool compaction_filter_created() const { return compaction_filter_created_; }
+
+  const char* Name() const override { return "EmptyFilterFactory"; }
+  bool compaction_filter_created_;
+};
+
+TEST_P(CompactionServiceTest, SubCompactionWithFilterFactory) {
+  EmptyFilterFactory* filter = new EmptyFilterFactory();
+  Options options = CurrentOptions();
+  options.compaction_filter_factory.reset(filter);
+  options.max_subcompactions = 10;
+  options.target_file_size_base = 1 << 10;  // 1KB
+  options.disable_auto_compactions = true;
+  ReopenWithCompactionService(&options);
+
+  GenerateTestData();
+  VerifyTestData();
+
+  auto my_cs = GetCompactionService();
+  int compaction_num_before = my_cs->GetCompactionNum();
+
+  auto cro = CompactRangeOptions();
+  cro.max_subcompactions = 10;
+  Status s = db_->CompactRange(cro, nullptr, nullptr);
+  ASSERT_OK(s);
+  VerifyTestData();
+  int compaction_num = my_cs->GetCompactionNum() - compaction_num_before;
+  // make sure there's sub-compaction by checking the compaction number
+  ASSERT_GE(compaction_num, 2);
+  ASSERT_TRUE(filter->compaction_filter_created());
+}
+
 TEST_P(CompactionServiceTest, Snapshot) {
   Options options = CurrentOptions();
   ReopenWithCompactionService(&options);
