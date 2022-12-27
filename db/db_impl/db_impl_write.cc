@@ -1298,15 +1298,9 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
     }
   }
 
+  // Ordering: before write delay.
   if (UNLIKELY(status.ok() && write_buffer_manager_->ShouldFlush())) {
-    // Before a new memtable is added in SwitchMemtable(),
-    // write_buffer_manager_->ShouldFlush() will keep returning true. If another
-    // thread is writing to another DB with the same write buffer, they may also
-    // be flushed. We may end up with flushing much more DBs than needed. It's
-    // suboptimal but still correct.
-    InstrumentedMutexLock l(&mutex_);
-    WaitForPendingWrites();
-    status = HandleWriteBufferManagerFlush(write_context);
+    write_buffer_manager_->MaybeFlush(this);
   }
 
   if (UNLIKELY(status.ok() && !trim_history_scheduler_.Empty())) {
@@ -1778,92 +1772,6 @@ Status DBImpl::SwitchWAL(WriteContext* write_context) {
       FlushRequest flush_req;
       GenerateFlushRequest(cfds, &flush_req);
       SchedulePendingFlush(flush_req, FlushReason::kWalFull);
-    }
-    MaybeScheduleFlushOrCompaction();
-  }
-  return status;
-}
-
-Status DBImpl::HandleWriteBufferManagerFlush(WriteContext* write_context) {
-  mutex_.AssertHeld();
-  assert(write_context != nullptr);
-  Status status;
-
-  // Before a new memtable is added in SwitchMemtable(),
-  // write_buffer_manager_->ShouldFlush() will keep returning true. If another
-  // thread is writing to another DB with the same write buffer, they may also
-  // be flushed. We may end up with flushing much more DBs than needed. It's
-  // suboptimal but still correct.
-  ROCKS_LOG_INFO(
-      immutable_db_options_.info_log,
-      "Flushing column family with oldest memtable entry. Write buffers are "
-      "using %" ROCKSDB_PRIszt " bytes out of a total of %" ROCKSDB_PRIszt ".",
-      write_buffer_manager_->memory_usage(),
-      write_buffer_manager_->buffer_size());
-  // no need to refcount because drop is happening in write thread, so can't
-  // happen while we're in the write thread
-  autovector<ColumnFamilyData*> cfds;
-  if (immutable_db_options_.atomic_flush) {
-    SelectColumnFamiliesForAtomicFlush(&cfds);
-  } else {
-    ColumnFamilyData* cfd_picked = nullptr;
-    SequenceNumber seq_num_for_cf_picked = kMaxSequenceNumber;
-
-    for (auto cfd : *versions_->GetColumnFamilySet()) {
-      if (cfd->IsDropped()) {
-        continue;
-      }
-      if (!cfd->mem()->IsEmpty()) {
-        // We only consider active mem table, hoping immutable memtable is
-        // already in the process of flushing.
-        uint64_t seq = cfd->mem()->GetCreationSeq();
-        if (cfd_picked == nullptr || seq < seq_num_for_cf_picked) {
-          cfd_picked = cfd;
-          seq_num_for_cf_picked = seq;
-        }
-      }
-    }
-    if (cfd_picked != nullptr) {
-      cfds.push_back(cfd_picked);
-    }
-    MaybeFlushStatsCF(&cfds);
-  }
-
-  WriteThread::Writer nonmem_w;
-  if (two_write_queues_) {
-    nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
-  }
-  for (const auto cfd : cfds) {
-    if (cfd->mem()->IsEmpty()) {
-      continue;
-    }
-    cfd->Ref();
-    status = SwitchMemtable(cfd, write_context);
-    cfd->UnrefAndTryDelete();
-    if (!status.ok()) {
-      break;
-    }
-  }
-  if (two_write_queues_) {
-    nonmem_write_thread_.ExitUnbatched(&nonmem_w);
-  }
-
-  if (status.ok()) {
-    if (immutable_db_options_.atomic_flush) {
-      AssignAtomicFlushSeq(cfds);
-    }
-    for (const auto cfd : cfds) {
-      cfd->imm()->FlushRequested();
-      if (!immutable_db_options_.atomic_flush) {
-        FlushRequest flush_req;
-        GenerateFlushRequest({cfd}, &flush_req);
-        SchedulePendingFlush(flush_req, FlushReason::kWriteBufferManager);
-      }
-    }
-    if (immutable_db_options_.atomic_flush) {
-      FlushRequest flush_req;
-      GenerateFlushRequest(cfds, &flush_req);
-      SchedulePendingFlush(flush_req, FlushReason::kWriteBufferManager);
     }
     MaybeScheduleFlushOrCompaction();
   }
@@ -2365,10 +2273,12 @@ size_t DBImpl::GetWalPreallocateBlockSize(uint64_t write_buffer_size) const {
   if (immutable_db_options_.db_write_buffer_size > 0) {
     bsize = std::min<size_t>(bsize, immutable_db_options_.db_write_buffer_size);
   }
-  if (immutable_db_options_.write_buffer_manager &&
-      immutable_db_options_.write_buffer_manager->enabled()) {
-    bsize = std::min<size_t>(
-        bsize, immutable_db_options_.write_buffer_manager->buffer_size());
+  if (immutable_db_options_.write_buffer_manager) {
+    size_t buffer_size =
+        immutable_db_options_.write_buffer_manager->flush_size();
+    if (buffer_size > 0) {
+      bsize = std::min<size_t>(bsize, buffer_size);
+    }
   }
 
   return bsize;

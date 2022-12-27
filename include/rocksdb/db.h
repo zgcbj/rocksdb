@@ -1193,6 +1193,10 @@ class DB {
     GetApproximateMemTableStats(DefaultColumnFamily(), range, count, size);
   }
 
+  virtual void GetApproximateActiveMemTableStats(
+      ColumnFamilyHandle* /*column_family*/, uint64_t* const /*memory_bytes*/,
+      uint64_t* const /*oldest_key_time*/) {}
+
   // Deprecated versions of GetApproximateSizes
   ROCKSDB_DEPRECATED_FUNC virtual void GetApproximateSizes(
       const Range* range, int n, uint64_t* sizes, bool include_memtable) {
