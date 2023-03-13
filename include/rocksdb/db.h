@@ -284,6 +284,44 @@ class DB {
       const std::string& input, std::string* output,
       const CompactionServiceOptionsOverride& override_options);
 
+  // Merge multiple DBs into this one. All DBs must have disjoint internal
+  // keys.
+  //
+  // # Tips
+  //
+  // The provided DBs must be disjoint: their internal key ranges don't overlap
+  // each other. Calling `CompactRange` on the complementary ranges can make
+  // sure user-visible key range consistent with internal key range. Caveats are
+  // (1) sometimes `bottommost_level_compaction` needs to be configured to avoid
+  // trivial move; (2) range tombstones are very tricky, they might be retained
+  // even if there's no out-of-ranges key.
+  //
+  // To avoid triggering L0 (or Memtable) stall conditions, user can consider
+  // dynamically decreasing the corresponding limits before entering merge.
+  //
+  // WAL merge is not supported. User must write with disableWAL=true, or wait
+  // for all WALs to be retired before merging.
+  //
+  // To have the best performance, use the same `block_cache` and
+  // `prefix_extractor` in DB options.
+  //
+  // # Safety
+  //
+  // Performing merge on DBs that are still undergoing writes results in
+  // undefined behavior.
+  //
+  // Using different implementations of user comparator results in undefined
+  // behavior as well.
+  //
+  // Concurrently apply several merge operations on the same instance can cause
+  // deadlock.
+  //
+  virtual Status MergeDisjointInstances(
+      const MergeInstanceOptions& /*merge_options*/,
+      const std::vector<DB*>& /*instances*/) {
+    return Status::NotSupported("`MergeDisjointInstances` not implemented");
+  }
+
   virtual Status Resume() { return Status::NotSupported(); }
 
   // Close the DB by releasing resources, closing files etc. This should be
