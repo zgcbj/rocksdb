@@ -386,6 +386,51 @@ TEST_P(DBWriteTest, UnflushedPutRaceWithTrackedWalSync) {
   Close();
 }
 
+TEST_P(DBWriteTest, InactiveWalFullySyncedBeforeUntracked) {
+  // Repro bug where a WAL is appended and switched after
+  // `FlushWAL(true /* sync */)`'s sync finishes and before it untracks fully
+  // synced inactive logs. Previously such a WAL would be wrongly untracked
+  // so the final append would never be synced.
+  Options options = GetOptions();
+  std::unique_ptr<FaultInjectionTestEnv> fault_env(
+      new FaultInjectionTestEnv(env_));
+  options.env = fault_env.get();
+  Reopen(options);
+
+  ASSERT_OK(Put("key1", "val1"));
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncWAL:BeforeMarkLogsSynced:1", [this](void* /* arg */) {
+        ASSERT_OK(Put("key2", "val2"));
+        ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(db_->FlushWAL(true /* sync */));
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_OK(Put("key3", "val3"));
+
+  ASSERT_OK(db_->FlushWAL(true /* sync */));
+
+  Close();
+
+  // Simulate full loss of unsynced data. This should drop nothing since we did
+  // `FlushWAL(true /* sync */)` before `Close()`.
+  fault_env->DropUnsyncedFileData();
+
+  Reopen(options);
+
+  ASSERT_EQ("val1", Get("key1"));
+  ASSERT_EQ("val2", Get("key2"));
+  ASSERT_EQ("val3", Get("key3"));
+
+  // Need to close before `fault_env` goes out of scope.
+  Close();
+}
+
 TEST_P(DBWriteTest, IOErrorOnWALWriteTriggersReadOnlyMode) {
   std::unique_ptr<FaultInjectionTestEnv> mock_env(
       new FaultInjectionTestEnv(env_));
@@ -561,6 +606,111 @@ TEST_P(DBWriteTest, MultiThreadWrite) {
   }
 
   Close();
+}
+
+class SimpleCallback : public PostWriteCallback {
+  std::function<void(SequenceNumber)> f_;
+
+ public:
+  SimpleCallback(std::function<void(SequenceNumber)>&& f) : f_(f) {}
+
+  void Callback(SequenceNumber seq) override { f_(seq); }
+};
+
+TEST_P(DBWriteTest, PostWriteCallback) {
+  Options options = GetOptions();
+  if (options.two_write_queues) {
+    // Not compatible.
+    return;
+  }
+  Reopen(options);
+
+  std::vector<port::Thread> threads;
+
+  port::Mutex the_first_can_exit_write_mutex;
+  the_first_can_exit_write_mutex.Lock();
+  port::Mutex can_flush_mutex;
+  can_flush_mutex.Lock();
+  port::Mutex the_second_can_enter_write_mutex;
+  the_second_can_enter_write_mutex.Lock();
+  port::Mutex the_second_can_exit_write_mutex;
+  the_second_can_exit_write_mutex.Lock();
+
+  std::atomic<uint64_t> written(0);
+  std::atomic<bool> flushed(false);
+
+  threads.push_back(port::Thread([&] {
+    WriteBatch batch;
+    WriteOptions opts;
+    opts.sync = false;
+    opts.disableWAL = true;
+    SimpleCallback callback([&](SequenceNumber seq) {
+      ASSERT_NE(seq, 0);
+      the_second_can_enter_write_mutex.Unlock();
+      can_flush_mutex.Unlock();
+      the_first_can_exit_write_mutex.Lock();
+      the_second_can_exit_write_mutex.Unlock();
+      written.fetch_add(1, std::memory_order_relaxed);
+    });
+    batch.Put("key", "value");
+    ASSERT_OK(dbfull()->Write(opts, &batch, &callback));
+  }));
+  threads.push_back(port::Thread([&] {
+    WriteBatch batch;
+    WriteOptions opts;
+    opts.sync = false;
+    opts.disableWAL = true;
+    SimpleCallback callback([&](SequenceNumber seq) {
+      ASSERT_NE(seq, 0);
+      the_second_can_exit_write_mutex.Lock();
+      written.fetch_add(1, std::memory_order_relaxed);
+    });
+    batch.Put("key", "value");
+    the_second_can_enter_write_mutex.Lock();
+    ASSERT_OK(dbfull()->Write(opts, &batch, &callback));
+  }));
+  // Flush will enter write thread and wait for pending writes.
+  threads.push_back(port::Thread([&] {
+    FlushOptions opts;
+    opts.wait = false;
+    can_flush_mutex.Lock();
+    ASSERT_OK(dbfull()->Flush(opts));
+    flushed.store(true, std::memory_order_relaxed);
+  }));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  ASSERT_EQ(written.load(std::memory_order_relaxed), 0);
+  ASSERT_EQ(flushed.load(std::memory_order_relaxed), false);
+
+  the_first_can_exit_write_mutex.Unlock();
+  size_t wait = 0;
+  while (!flushed.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    wait += 1;
+    ASSERT_LE(wait, 100);
+  }
+  ASSERT_EQ(written.load(std::memory_order_relaxed), 2);
+
+  for (auto& t : threads) {
+    t.join();
+  }
+}
+
+TEST_P(DBWriteTest, PostWriteCallbackEmptyBatch) {
+  Options options = GetOptions();
+  if (options.two_write_queues) {
+    // Not compatible.
+    return;
+  }
+  Reopen(options);
+  WriteBatch batch;
+  WriteOptions opts;
+  opts.sync = false;
+  opts.disableWAL = true;
+  SequenceNumber seq = 0;
+  SimpleCallback callback([&](SequenceNumber s) { seq = s; });
+  ASSERT_OK(dbfull()->Write(opts, &batch, &callback));
+  ASSERT_NE(seq, 0);
 }
 
 INSTANTIATE_TEST_CASE_P(DBWriteTestInstance, DBWriteTest,
